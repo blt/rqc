@@ -1,0 +1,9 @@
+[package]
+name = "rqc-core"
+version = "0.1.0"
+authors = ["Brian L. Troutwine <brian@troutwine.us>"]
+edition = "2018"
+
+[dependencies]
+arbitrary = { git = "https://github.com/blt/rust_arbitrary", branch = "rqc_dev" }
+rand = "0.6"

@@ -1,0 +1,14 @@
+[package]
+name = "rqc"
+version = "0.1.0"
+authors = ["Brian L. Troutwine <brian@troutwine.us>"]
+edition = "2018"
+
+[dependencies]
+clap      = "2.32"
+
+[dev-dependencies]
+rqc-core = {path = "./rqc-core"}
+
+[workspace]
+members = [".", "rqc-core"]
