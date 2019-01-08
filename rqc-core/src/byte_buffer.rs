@@ -1,16 +1,4 @@
-use crate::arbitrary::Unstructured;
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
-
-/// An enumeration of buffer creation errors
-#[derive(Debug, Clone, Copy)]
-pub enum BufferInitError {
-    /// The input buffer is empty, causing construction of some buffer types to
-    /// fail
-    EmptyInput,
-    /// The input buffer is too small, please increase size
-    BufferTooSmall,
-}
+use crate::arbitrary::{Arbitrary, Unstructured};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 /// Potential errors of the [`ByteBuffer`]
@@ -18,88 +6,52 @@ pub enum BufferOpError {
     /// A request was made to fill a buffer, shift etc but there were
     /// insufficient bytes to accomplish this
     InsufficientBytes,
-    /// The requested shift failed because this shift would cause wrap-around,
-    /// duplicating tests
-    ShiftWrapAround,
 }
 
 /// A source of unstructured data which returns the same data over and over again
 ///
 /// This buffer acts as a byte buffer over the source of unstructured data,
 /// allowing for an infinite amount of not-very-random data.
-pub struct ByteBuffer {
-    buffer: Vec<u8>,
-    rng: SmallRng,
-    pub offset: usize,
-    shift_offset: usize,
-    virtual_len: usize,
+pub struct FiniteByteBuffer<'a> {
+    buffer: &'a [u8],
+    offset: usize,
+    container_size_limit: usize,
 }
 
-impl ByteBuffer {
+impl<'a> FiniteByteBuffer<'a> {
     /// Create a new ByteBuffer
-    pub fn new(capacity: usize, seed: u64) -> Result<Self, BufferInitError> {
-        if capacity == 0 {
-            return Err(BufferInitError::EmptyInput);
-        }
-        if capacity <= 2 {
-            return Err(BufferInitError::BufferTooSmall);
-        }
-        let mut buffer: Vec<u8> = Vec::with_capacity(capacity);
-        let mut rng = SmallRng::seed_from_u64(seed);
-        for _ in 0..capacity {
-            buffer.push(rng.gen::<u8>())
-        }
-        Ok(ByteBuffer {
-            virtual_len: buffer.len() / 1,
-            shift_offset: 0,
+    pub fn new(buffer: &'a [u8]) -> Self {
+        FiniteByteBuffer {
             offset: 0,
             buffer,
-            rng,
-        })
-    }
-
-    pub fn shift_right(&mut self) -> Result<(), BufferOpError> {
-        if self.shift_offset != 0 && ((self.shift_offset + 1) % self.buffer.len() == 0) {
-            return Err(BufferOpError::ShiftWrapAround);
-        } else {
-            self.shift_offset += 1;
-            self.offset = self.shift_offset;
-            return Ok(());
+            container_size_limit: 256,
         }
     }
 
-    pub fn soft_reset(&mut self) {
-        self.offset = self.shift_offset;
-        self.virtual_len = self.buffer.len() / 2;
-    }
-
-    pub fn hard_reset(&mut self) {
-        self.soft_reset();
-        for b in self.buffer.iter_mut() {
-            *b = self.rng.gen::<u8>();
-        }
-    }
-
-    pub fn shrink_from(&mut self, offset: usize) -> usize {
-        self.offset = offset;
-        self.virtual_len /= 2;
-        self.virtual_len
+    /// Set the non-default container size limit
+    pub fn container_size_limit(mut self, csl: usize) -> Self {
+        self.container_size_limit = csl;
+        self
     }
 }
 
-impl Unstructured for ByteBuffer {
+impl<'a> Unstructured for FiniteByteBuffer<'a> {
     type Error = BufferOpError;
     fn fill_buffer(&mut self, buffer: &mut [u8]) -> Result<(), Self::Error> {
-        let b = [
-            &self.buffer[self.offset..self.virtual_len],
-            &self.buffer[..self.offset],
-        ];
-        let it = ::std::iter::repeat(&b[..]).flat_map(|x| x).flat_map(|&x| x);
-        self.offset = (self.offset + buffer.len()) % self.virtual_len;
-        for (d, f) in buffer.iter_mut().zip(it) {
-            *d = *f;
+        if self.buffer.len().saturating_sub(self.offset) >= buffer.len() {
+            let max = self.offset + buffer.len();
+            for (i, idx) in (self.offset..max).enumerate() {
+                buffer[i] = self.buffer[idx];
+            }
+            self.offset = max;
+            Ok(())
+        } else {
+            Err(BufferOpError::InsufficientBytes)
         }
-        Ok(())
+    }
+
+    fn container_size(&mut self) -> Result<usize, Self::Error> {
+        <usize as Arbitrary>::arbitrary(self).map(|x| x % self.container_size_limit)
     }
 }
 

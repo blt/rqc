@@ -5,4 +5,3 @@ authors = ["Brian L. Troutwine <brian@troutwine.us>"]
 edition = "2018"
 
 [dependencies]
-rand = "0.6"
