@@ -1,5 +1,6 @@
 extern crate libc;
 extern crate nix;
+extern crate rand;
 extern crate rqc_core;
 
 use nix::errno::Errno;
@@ -8,15 +9,26 @@ use nix::sys::mman::{mmap, shm_open, shm_unlink, MapFlags, ProtFlags};
 use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execv, fork, ftruncate, ForkResult};
-use rqc_core::Comm;
+use rand::rngs::SmallRng;
+use rand::{FromEntropy, Rng};
+use rqc_core::{Comm, Stat};
 use std::ffi::CString;
+use std::io::Write;
 use std::path::Path;
 
-pub struct Rqc {}
+pub struct Rqc {
+    shm_total_bytes: usize,
+    shm_path: String,
+    target_byte_pool_size: usize,
+}
 
 impl Rqc {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            shm_total_bytes: 1024,
+            shm_path: String::from("/RQC"),
+            target_byte_pool_size: 256,
+        }
     }
 
     pub fn build(&self) -> () {
@@ -49,12 +61,15 @@ impl Rqc {
             | Mode::S_IWGRP
             | Mode::S_IROTH
             | Mode::S_IWOTH;
-        let shm_path = "/RQC";
-        let memfd = shm_open(shm_path, OFlag::O_CREAT | OFlag::O_RDWR, def_file_mode)
-            .expect("failed to open shared memory");
-        let total_bytes: usize = 1024;
-        if let Err(e) = ftruncate(memfd, total_bytes as i64) {
-            shm_unlink(shm_path).expect("failed to unlink opened shm");
+        let _ = shm_unlink(self.shm_path.as_str());
+        let memfd = shm_open(
+            self.shm_path.as_str(),
+            OFlag::O_CREAT | OFlag::O_RDWR,
+            def_file_mode,
+        )
+        .expect("failed to open shared memory");
+        if let Err(e) = ftruncate(memfd, self.shm_total_bytes as i64) {
+            shm_unlink(self.shm_path.as_str()).expect("failed to unlink opened shm");
             println!(
                 "could not truncate shared memory to appropriate size: {}",
                 e
@@ -72,7 +87,7 @@ impl Rqc {
             )
             .expect("could not memory map shared memory file")
         };
-        let mut comm = Comm::new(ptr, total_bytes);
+        let mut comm = Comm::new(ptr, self.shm_total_bytes);
         // NOTE(blt) -- okay, now, at this point we actually need to fork/exec
         // and get a child process to do a similar mmap dance. Also, we should
         // hide this inside a proper type. Initial goal: just get a handshake
@@ -88,22 +103,60 @@ impl Rqc {
 
         match fork() {
             Ok(ForkResult::Parent { child, .. }) => {
+                let mut rng = SmallRng::from_entropy();
+                let mut bytes: Vec<u8> = Vec::with_capacity(self.target_byte_pool_size);
+                for _ in 0..self.target_byte_pool_size {
+                    bytes.push(0);
+                }
                 let mut st = 0;
 
-                // Wait for the client to signal that its ready, then we'll
-                // signal that we're ready.
+                // Okay, here's the server/target protocol. The client signals
+                // that it's ready and the server then writes random bytes down
+                // the comm, possibly doing a shrink if our pass/fail/skip
+                // levels have changed to indicate a failure. The server will
+                // switch the client to a non-ready state, meaning that the
+                // client only ever switches itself to ready when the server has
+                // previously noted that it's time has come.
                 //
-                // NOTE(blt) if the client does not answer we're going to hang
-                // here forever, something to consider. This loop needs to be
-                // part of the waitpid loop.
-                while !comm.is_client_ready() {}
-                println!("CLIENT HANDSHAKE CONFIRMED");
-                comm.server_ready();
+                // It's late and I"m tired. A diagram will explain this
+                // better. What we want to avoid is stalling on signals or some
+                // such.
 
                 loop {
+                    // NOTE(blt) -- this loop is not going to work. The client
+                    // needs to be able to advertise several states:
+                    //
+                    // * the client is ready to receive a byte blog
+                    // * the client ran the byte blob and has results
+                    // * the client is still executing the byte blob
+                    // * the client failed
+                    //
+                    // This means extending Comm, I think, and changing this
+                    // loop. Tomorrow.
+                    //
+                    // Also of note, there's no shrinking yet. No shrinking, no
+                    // way to replay and all the indexes are just wacky.
+
+                    // println!(
+                    //     "PASSED: {}\tSKIPPED: {}\tFAILED: {}",
+                    //     comm.stat(Stat::PassedTests),
+                    //     comm.stat(Stat::SkippedTests),
+                    //     comm.stat(Stat::FailedTests)
+                    // );
                     match waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
                         Ok(status) => match status {
                             WaitStatus::StillAlive => {
+                                if comm.is_client_ready() {
+                                    for b in bytes.iter_mut() {
+                                        *b = rng.gen::<u8>();
+                                    }
+                                    let l = comm
+                                        .write(&mut bytes)
+                                        .expect("unable to write random bytes to target");
+                                    println!("WROTE {} BYTES TO TARGET", l);
+                                    comm.client_unready();
+                                    comm.server_ready();
+                                }
                                 continue;
                             }
                             WaitStatus::Exited(_, exit_status) => {
@@ -128,20 +181,24 @@ impl Rqc {
                     }
                     break;
                 }
-                shm_unlink(shm_path).expect("failed to unlink opened shm");
+                shm_unlink(self.shm_path.as_str()).expect("failed to unlink opened shm");
                 ::std::process::exit(st);
             }
             Ok(ForkResult::Child) => {
                 // TODO(blt) for some reason the args aren't getting passed to the child
-                execv(&c_path, &[c_path.clone(), CString::new(shm_path).unwrap()])
-                    .expect("could not execv");
+                execv(
+                    &c_path,
+                    &[
+                        c_path.clone(),
+                        CString::new(self.shm_path.as_str()).unwrap(),
+                    ],
+                )
+                .expect("could not execv");
             }
             Err(_) => {
                 println!("Unable to fork target");
                 ::std::process::exit(1);
             }
         }
-        // execv(&c_path, &[c_path.clone(), CString::new(shm_path).unwrap()])
-        //     .expect("could not execv");
     }
 }

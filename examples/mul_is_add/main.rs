@@ -27,6 +27,6 @@ fn main() {
         .expect("must have a path to shm for communication with server");
 
     println!("SHM_PATH: {}", shm_path);
-    let rqc: Rqc = RqcBuild::new().ui_update_seconds(60).build();
+    let rqc: Rqc = RqcBuild::new().build();
     rqc.run(&shm_path, check)
 }
