@@ -8,8 +8,6 @@ edition = "2018"
 clap = "2.32"
 nix  = "0.12"
 libc = "0.2"
-
-[dev-dependencies]
 rqc-core = {path = "./rqc-core"}
 
 [workspace]

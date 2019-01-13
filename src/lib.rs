@@ -1,5 +1,6 @@
 extern crate libc;
 extern crate nix;
+extern crate rqc_core;
 
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
@@ -7,8 +8,8 @@ use nix::sys::mman::{mmap, shm_open, shm_unlink, MapFlags, ProtFlags};
 use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execv, fork, ftruncate, ForkResult};
+use rqc_core::Comm;
 use std::ffi::CString;
-use std::os::unix::io::RawFd;
 use std::path::Path;
 
 pub struct Rqc {}
@@ -51,12 +52,16 @@ impl Rqc {
         let shm_path = "/RQC";
         let memfd = shm_open(shm_path, OFlag::O_CREAT | OFlag::O_RDWR, def_file_mode)
             .expect("failed to open shared memory");
-        if let Err(e) = ftruncate(memfd, 1024) {
+        let total_bytes: usize = 1024;
+        if let Err(e) = ftruncate(memfd, total_bytes as i64) {
             shm_unlink(shm_path).expect("failed to unlink opened shm");
-            println!("could not truncate shared memory to appropriate size");
+            println!(
+                "could not truncate shared memory to appropriate size: {}",
+                e
+            );
             ::std::process::exit(1);
         }
-        let ptr = unsafe {
+        let ptr: *mut libc::c_void = unsafe {
             mmap(
                 0 as *mut libc::c_void,
                 1024,
@@ -67,6 +72,7 @@ impl Rqc {
             )
             .expect("could not memory map shared memory file")
         };
+        let mut comm = Comm::new(ptr, total_bytes);
         // NOTE(blt) -- okay, now, at this point we actually need to fork/exec
         // and get a child process to do a similar mmap dance. Also, we should
         // hide this inside a proper type. Initial goal: just get a handshake
@@ -83,6 +89,17 @@ impl Rqc {
         match fork() {
             Ok(ForkResult::Parent { child, .. }) => {
                 let mut st = 0;
+
+                // Wait for the client to signal that its ready, then we'll
+                // signal that we're ready.
+                //
+                // NOTE(blt) if the client does not answer we're going to hang
+                // here forever, something to consider. This loop needs to be
+                // part of the waitpid loop.
+                while !comm.is_client_ready() {}
+                println!("CLIENT HANDSHAKE CONFIRMED");
+                comm.server_ready();
+
                 loop {
                     match waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
                         Ok(status) => match status {

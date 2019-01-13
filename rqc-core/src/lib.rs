@@ -1,8 +1,16 @@
+extern crate libc;
+extern crate nix;
+
 mod arbitrary;
 mod byte_buffer;
+mod comm;
 
 pub use crate::arbitrary::*;
 pub use crate::byte_buffer::*;
+pub use crate::comm::*;
+use nix::fcntl::OFlag;
+use nix::sys::mman::{mmap, shm_open, MapFlags, ProtFlags};
+use nix::sys::stat::{fstat, Mode};
 use std::io::Read;
 use std::{io, time};
 
@@ -49,10 +57,33 @@ pub enum TestResult {
 }
 
 impl Rqc {
-    pub fn run<F>(self, closure: F)
+    pub fn run<F>(self, shm_path: &str, closure: F)
     where
         F: Fn(&mut FiniteByteBuffer) -> Result<TestResult, BufferOpError>,
     {
+        let def_file_mode = Mode::S_IRUSR
+            | Mode::S_IWUSR
+            | Mode::S_IRGRP
+            | Mode::S_IWGRP
+            | Mode::S_IROTH
+            | Mode::S_IWOTH;
+        let memfd = shm_open(shm_path, OFlag::O_CREAT | OFlag::O_RDWR, def_file_mode)
+            .expect("failed to open shared memory");
+        let total_bytes = fstat(memfd).expect("could not fstat shm file").st_size as usize;
+
+        let ptr: *mut libc::c_void = unsafe {
+            mmap(
+                0 as *mut libc::c_void,
+                total_bytes,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                memfd,
+                0,
+            )
+            .expect("could not memory map shared memory file")
+        };
+        let mut comm = Comm::new(ptr, total_bytes);
+
         // NOTE(blt)
         //
         // instrumentation that is wanted
@@ -73,6 +104,10 @@ impl Rqc {
         }
         let stdin = io::stdin();
         let mut handle = stdin.lock();
+
+        comm.client_ready();
+        while !comm.is_server_ready() {}
+        println!("SERVER IS READY");
 
         loop {
             match handle.read(&mut io_buf) {

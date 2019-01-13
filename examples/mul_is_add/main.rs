@@ -1,6 +1,7 @@
 extern crate rqc_core;
 
 use rqc_core::{Arbitrary, BufferOpError, FiniteByteBuffer, Rqc, RqcBuild, TestResult};
+use std::env;
 
 fn check(buf: &mut FiniteByteBuffer) -> Result<TestResult, BufferOpError> {
     let lhs: u8 = Arbitrary::arbitrary(buf)?;
@@ -19,6 +20,13 @@ fn check(buf: &mut FiniteByteBuffer) -> Result<TestResult, BufferOpError> {
 }
 
 fn main() {
+    let mut args = env::args();
+    let _ = args.next().unwrap();
+    let shm_path = args
+        .next()
+        .expect("must have a path to shm for communication with server");
+
+    println!("SHM_PATH: {}", shm_path);
     let rqc: Rqc = RqcBuild::new().ui_update_seconds(60).build();
-    rqc.run(check)
+    rqc.run(&shm_path, check)
 }

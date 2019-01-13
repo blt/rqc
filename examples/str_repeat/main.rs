@@ -1,8 +1,8 @@
 extern crate rqc_core;
 
-use rqc_core::{Arbitrary, BufferOpError, ByteBuffer, Rqc, RqcBuild, TestResult};
+use rqc_core::{Arbitrary, BufferOpError, FiniteByteBuffer, Rqc, RqcBuild, TestResult};
 
-fn check(buf: &mut ByteBuffer) -> Result<TestResult, BufferOpError> {
+fn check(buf: &mut FiniteByteBuffer) -> Result<TestResult, BufferOpError> {
     let s: String = Arbitrary::arbitrary(buf)?;
     let repeats: u8 = Arbitrary::arbitrary(buf)?;
     let repeats: usize = repeats as usize;
@@ -20,9 +20,6 @@ fn check(buf: &mut ByteBuffer) -> Result<TestResult, BufferOpError> {
 }
 
 fn main() {
-    let rqc: Rqc = RqcBuild::new()
-        .runtime_seconds(60)
-        .maximum_tests(100_000_000)
-        .build();
+    let rqc: Rqc = RqcBuild::new().ui_update_seconds(60).build();
     rqc.run(check)
 }
