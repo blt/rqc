@@ -2,10 +2,12 @@ extern crate libc;
 extern crate nix;
 
 mod arbitrary;
+mod backoff;
 mod byte_buffer;
 mod comm;
 
 pub use crate::arbitrary::*;
+pub use crate::backoff::*;
 pub use crate::byte_buffer::*;
 pub use crate::comm::*;
 use nix::fcntl::OFlag;
@@ -89,38 +91,46 @@ impl Rqc {
             byte_buf.push(0);
         }
 
+        let mut backoff = Backoff::default();
         loop {
             comm.client_ready();
-            while !comm.is_server_ready() {}
-            println!("SERVER IS READY");
+            loop {
+                match comm.server_status() {
+                    ServerStatus::Ready => {
+                        backoff.reset();
+                        break;
+                    }
+                    _ => backoff.delay(),
+                }
+            }
 
             match comm.read(&mut byte_buf) {
                 Err(_) => ::std::process::exit(0),
-                Ok(0) => {
-                    println!("ZERO BYTES");
-                    continue;
-                }
+                Ok(0) => continue,
                 Ok(_) => {}
             }
             let mut buf = FiniteByteBuffer::new(&byte_buf);
+            match closure(&mut buf) {
+                Ok(TestResult::Passed) => {
+                    comm.client_test_status(TestStatus::Passed);
+                }
+                Ok(TestResult::Skipped) => {
+                    comm.client_test_status(TestStatus::Skipped);
+                }
+                Ok(TestResult::Failed) => {
+                    comm.client_test_status(TestStatus::Failed);
+                }
+                Err(BufferOpError::InsufficientBytes) => {
+                    comm.client_test_status(TestStatus::InsufficientBytes);
+                }
+            }
             loop {
-                println!("TEST TEST TEST");
-                match closure(&mut buf) {
-                    Ok(TestResult::Passed) => {
-                        comm.incr(Stat::PassedTests);
-                        continue;
-                    }
-                    Ok(TestResult::Skipped) => {
-                        comm.incr(Stat::SkippedTests);
-                        continue;
-                    }
-                    Ok(TestResult::Failed) => {
-                        comm.incr(Stat::FailedTests);
+                match comm.server_status() {
+                    ServerStatus::Default => {
+                        backoff.reset();
                         break;
                     }
-                    Err(BufferOpError::InsufficientBytes) => {
-                        ::std::process::exit(0);
-                    }
+                    _ => backoff.delay(),
                 }
             }
         }

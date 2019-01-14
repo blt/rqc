@@ -11,5 +11,8 @@ nix  = "0.12"
 rand = "0.6"
 rqc-core = {path = "./rqc-core"}
 
+[dev-dependencies]
+bh_alloc = "0.2"
+
 [workspace]
 members = [".", "rqc-core"]

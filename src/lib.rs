@@ -11,10 +11,11 @@ use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execv, fork, ftruncate, ForkResult};
 use rand::rngs::SmallRng;
 use rand::{FromEntropy, Rng};
-use rqc_core::{Comm, Stat};
+use rqc_core::{Backoff, ClientStatus, Comm, ServerStatus, TestStatus};
 use std::ffi::CString;
 use std::io::Write;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 pub struct Rqc {
     shm_total_bytes: usize,
@@ -101,104 +102,130 @@ impl Rqc {
         )
         .expect("unable to coerce path into c-style string");
 
-        match fork() {
-            Ok(ForkResult::Parent { child, .. }) => {
-                let mut rng = SmallRng::from_entropy();
-                let mut bytes: Vec<u8> = Vec::with_capacity(self.target_byte_pool_size);
-                for _ in 0..self.target_byte_pool_size {
-                    bytes.push(0);
-                }
-                let mut st = 0;
+        let mut restarts = 0;
+        let mut passed = 0;
+        let mut skipped = 0;
+        let mut failed = 0;
+        let mut crash_failure = 0;
+        let mut insufficient_bytes = 0;
+        let mut test_cases = 0;
 
-                // Okay, here's the server/target protocol. The client signals
-                // that it's ready and the server then writes random bytes down
-                // the comm, possibly doing a shrink if our pass/fail/skip
-                // levels have changed to indicate a failure. The server will
-                // switch the client to a non-ready state, meaning that the
-                // client only ever switches itself to ready when the server has
-                // previously noted that it's time has come.
-                //
-                // It's late and I"m tired. A diagram will explain this
-                // better. What we want to avoid is stalling on signals or some
-                // such.
+        let ui_delay = Duration::from_secs(1);
+        let mut start = Instant::now();
 
-                loop {
-                    // NOTE(blt) -- this loop is not going to work. The client
-                    // needs to be able to advertise several states:
-                    //
-                    // * the client is ready to receive a byte blog
-                    // * the client ran the byte blob and has results
-                    // * the client is still executing the byte blob
-                    // * the client failed
-                    //
-                    // This means extending Comm, I think, and changing this
-                    // loop. Tomorrow.
-                    //
-                    // Also of note, there's no shrinking yet. No shrinking, no
-                    // way to replay and all the indexes are just wacky.
-
-                    // println!(
-                    //     "PASSED: {}\tSKIPPED: {}\tFAILED: {}",
-                    //     comm.stat(Stat::PassedTests),
-                    //     comm.stat(Stat::SkippedTests),
-                    //     comm.stat(Stat::FailedTests)
-                    // );
-                    match waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
-                        Ok(status) => match status {
-                            WaitStatus::StillAlive => {
-                                if comm.is_client_ready() {
-                                    for b in bytes.iter_mut() {
-                                        *b = rng.gen::<u8>();
-                                    }
-                                    let l = comm
-                                        .write(&mut bytes)
-                                        .expect("unable to write random bytes to target");
-                                    println!("WROTE {} BYTES TO TARGET", l);
-                                    comm.client_unready();
-                                    comm.server_ready();
-                                }
-                                continue;
-                            }
-                            WaitStatus::Exited(_, exit_status) => {
-                                if exit_status != 0 {
-                                    println!("target exited with non-zero status: {}", exit_status);
-                                    st = exit_status;
-                                } else {
-                                    continue;
-                                }
-                            }
-                            s => {
-                                println!("target finished with status: {:?}", s);
-                            }
-                        },
-                        Err(e) => match e.as_errno() {
-                            Some(Errno::ECHILD) => {}
-                            _ => {
-                                println!("waiting on target failed with: {}", e);
-                                st = 1;
-                            }
-                        },
+        let mut restart_target = false;
+        let mut exit_status = None; // If exit status is ever Some then we quit
+        loop {
+            if exit_status.is_some() {
+                break;
+            }
+            match fork() {
+                Ok(ForkResult::Parent { child, .. }) => {
+                    let mut rng = SmallRng::from_entropy();
+                    let mut bytes: Vec<u8> = Vec::with_capacity(self.target_byte_pool_size);
+                    for _ in 0..self.target_byte_pool_size {
+                        bytes.push(0);
                     }
-                    break;
+
+                    let mut backoff = Backoff::default();
+                    loop {
+                        backoff.delay();
+                        if start.elapsed() >= ui_delay {
+                            start = Instant::now();
+                            println!(
+                                "TestCases: {} Restarts: {} Passed: {} Skipped: {} Failed: {} InsufficientBytes: {} CrashFail: {}",
+                                test_cases, restarts, passed, skipped, failed, insufficient_bytes, crash_failure
+                            );
+                        }
+                        // TODO(blt) -- if the child dies we need to be sure not
+                        // to leave an orphan around
+                        match waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
+                            Ok(status) => match status {
+                                WaitStatus::StillAlive => {
+                                    match comm.client_status() {
+                                        ClientStatus::Default => {
+                                            // nothing to do
+                                        }
+                                        ClientStatus::Ready => match comm.server_status() {
+                                            ServerStatus::Default => {
+                                                backoff.reset();
+                                                for b in bytes.iter_mut() {
+                                                    *b = rng.gen::<u8>();
+                                                }
+                                                let _ = comm.write(&mut bytes).expect(
+                                                    "unable to write random bytes to target",
+                                                );
+                                                test_cases += 1;
+                                                comm.server_ready();
+                                            }
+                                            ServerStatus::Ready => {}
+                                        },
+                                        ClientStatus::Test(test_status) => {
+                                            match test_status {
+                                                TestStatus::Passed => passed += 1,
+                                                TestStatus::Skipped => skipped += 1,
+                                                TestStatus::Failed => failed += 1,
+                                                TestStatus::InsufficientBytes => {
+                                                    insufficient_bytes += 1
+                                                }
+                                            }
+                                            comm.client_reset();
+                                            comm.server_reset();
+                                        }
+                                    }
+                                }
+                                WaitStatus::Exited(_, status) => {
+                                    if status != 0 {
+                                        println!("target exited with non-zero status: {}", status);
+                                        crash_failure += 1;
+                                        restart_target = true;
+                                    } else {
+                                        if test_cases == 0 {
+                                            println!(
+                                                "target exited before a test could be given to it"
+                                            );
+                                            exit_status = Some(1); // TODO(blt) -- have well-defined exit status meanings
+                                        } else {
+                                            restart_target = true;
+                                        }
+                                    }
+                                }
+                                s => {
+                                    println!("target finished with status: {:?}", s);
+                                }
+                            },
+                            Err(e) => match e.as_errno() {
+                                Some(Errno::ECHILD) => {}
+                                _ => {
+                                    println!("waiting on target failed with: {}", e);
+                                    exit_status = Some(1) // TODO(blt) -- have well-defined exit status meanings
+                                }
+                            },
+                        }
+                        if restart_target || exit_status.is_some() {
+                            restarts += 1;
+                            break;
+                        }
+                    }
                 }
-                shm_unlink(self.shm_path.as_str()).expect("failed to unlink opened shm");
-                ::std::process::exit(st);
+                Ok(ForkResult::Child) => {
+                    // TODO(blt) for some reason the args aren't getting passed to the child
+                    execv(
+                        &c_path,
+                        &[
+                            c_path.clone(),
+                            CString::new(self.shm_path.as_str()).unwrap(),
+                        ],
+                    )
+                    .expect("could not execv");
+                }
+                Err(_) => {
+                    println!("Unable to fork target");
+                    ::std::process::exit(1);
+                }
             }
-            Ok(ForkResult::Child) => {
-                // TODO(blt) for some reason the args aren't getting passed to the child
-                execv(
-                    &c_path,
-                    &[
-                        c_path.clone(),
-                        CString::new(self.shm_path.as_str()).unwrap(),
-                    ],
-                )
-                .expect("could not execv");
-            }
-            Err(_) => {
-                println!("Unable to fork target");
-                ::std::process::exit(1);
-            }
-        }
+        } // end loop
+        shm_unlink(self.shm_path.as_str()).expect("failed to unlink opened shm");
+        ::std::process::exit(exit_status.unwrap());
     }
 }

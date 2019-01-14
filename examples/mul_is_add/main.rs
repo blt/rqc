@@ -26,7 +26,6 @@ fn main() {
         .next()
         .expect("must have a path to shm for communication with server");
 
-    println!("SHM_PATH: {}", shm_path);
     let rqc: Rqc = RqcBuild::new().build();
     rqc.run(&shm_path, check)
 }
