@@ -8,6 +8,7 @@ use derive_builder::Builder;
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::sys::mman::{mmap, shm_open, shm_unlink, MapFlags, ProtFlags};
+use nix::sys::signal::Signal;
 use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execv, fork, ftruncate, ForkResult};
@@ -51,6 +52,8 @@ impl Rqc {
     }
 
     pub fn run(&self, target: &Path) -> () {
+        assert!(self.target_byte_pool_size < self.shm_total_bytes);
+
         let def_file_mode = Mode::S_IRUSR
             | Mode::S_IWUSR
             | Mode::S_IRGRP
@@ -75,7 +78,7 @@ impl Rqc {
         let ptr: *mut libc::c_void = unsafe {
             mmap(
                 0 as *mut libc::c_void,
-                1024,
+                self.shm_total_bytes,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 MapFlags::MAP_SHARED,
                 memfd,
@@ -185,6 +188,13 @@ impl Rqc {
                                         }
                                     }
                                 }
+                                WaitStatus::Signaled(_, signal, _) => match signal {
+                                    Signal::SIGSEGV => {
+                                        println!("target died with SIGSEGV");
+                                        restart_target = true;
+                                    }
+                                    _ => unreachable!(),
+                                },
                                 s => {
                                     println!("target finished with status: {:?}", s);
                                 }
@@ -198,6 +208,15 @@ impl Rqc {
                             },
                         }
                         if restart_target || exit_status.is_some() {
+                            // must wait for the SIGCHLD or we get a zombie process
+                            match waitpid(child, None) {
+                                Ok(status) => match status {
+                                    WaitStatus::Signaled(_, Signal::SIGCHLD, _) => {}
+                                    _ => unreachable!(),
+                                },
+                                _ => unreachable!(),
+                            }
+
                             restarts += 1;
                             break;
                         }
