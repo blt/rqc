@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 clap = "2.32"
+derive_builder = "0.7"
 libc = "0.2"
 nix  = "0.12"
 rand = "0.6"

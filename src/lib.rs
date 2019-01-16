@@ -1,8 +1,10 @@
+extern crate derive_builder;
 extern crate libc;
 extern crate nix;
 extern crate rand;
 extern crate rqc_core;
 
+use derive_builder::Builder;
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::sys::mman::{mmap, shm_open, shm_unlink, MapFlags, ProtFlags};
@@ -17,6 +19,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+#[derive(Builder, Debug)]
 pub struct Rqc {
     shm_total_bytes: usize,
     shm_path: String,
@@ -24,14 +27,6 @@ pub struct Rqc {
 }
 
 impl Rqc {
-    pub fn new() -> Self {
-        Self {
-            shm_total_bytes: 1024,
-            shm_path: String::from("/RQC"),
-            target_byte_pool_size: 256,
-        }
-    }
-
     pub fn build(&self) -> () {
         let cargo_path = env!("CARGO");
 
